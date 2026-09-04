@@ -5,23 +5,24 @@ import threading
 import os
 
 # ── Renkler & Font ──────────────────────────────────────────────
-BG       = "#0f0f0f"
-CARD     = "#1a1a1a"
-ACCENT   = "#ff4444"
-ACCENT2  = "#ff6b35"
-TEXT     = "#f0f0f0"
-MUTED    = "#666666"
-SUCCESS  = "#44ff88"
-BORDER   = "#2a2a2a"
-PIN_ON   = "#ffcc00"
+BG = "#0f0f0f"
+CARD = "#1a1a1a"
+ACCENT = "#ff4444"
+ACCENT2 = "#ff6b35"
+TEXT = "#f0f0f0"
+MUTED = "#666666"
+SUCCESS = "#44ff88"
+BORDER = "#2a2a2a"
+PIN_ON = "#ffcc00"
 
-FONT_TITLE  = ("Consolas", 22, "bold")
-FONT_LABEL  = ("Consolas", 10)
-FONT_BTN    = ("Consolas", 11, "bold")
-FONT_LOG    = ("Consolas", 9)
-FONT_SMALL  = ("Consolas", 8)
+FONT_TITLE = ("Consolas", 22, "bold")
+FONT_LABEL = ("Consolas", 10)
+FONT_BTN = ("Consolas", 11, "bold")
+FONT_LOG = ("Consolas", 9)
+FONT_SMALL = ("Consolas", 8)
 
 DEFAULT_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
+
 
 class App(tk.Tk):
     def __init__(self):
@@ -30,31 +31,31 @@ class App(tk.Tk):
         self.geometry("680x600")
         self.resizable(False, False)
         self.configure(bg=BG)
-        self.download_dir  = tk.StringVar(value=DEFAULT_DIR)
-        self.quality       = tk.StringVar(value="best")
-        self.cookies       = tk.StringVar(value="")
+
+        self.download_dir = tk.StringVar(value=DEFAULT_DIR)
+        self.quality = tk.StringVar(value="best")
+        self.cookies = tk.StringVar(value="")
         self._last_clipboard = ""
         self._is_downloading = False
-        self._auto_dl    = tk.BooleanVar(value=True)   # otomatik indir
-        self._always_top = tk.BooleanVar(value=False)  # her zaman üstte
+        self._auto_dl = tk.BooleanVar(value=True)       # otomatik indir
+        self._always_top = tk.BooleanVar(value=False)   # her zaman üstte
+
         self._build()
         self._poll_clipboard()
 
     # ── Arayüz ─────────────────────────────────────────────────
     def _build(self):
-        # Başlık + pin butonu
         hdr = tk.Frame(self, bg=BG, pady=14)
         hdr.pack(fill="x", padx=30)
-        tk.Label(hdr, text="▶  YT-DLP", font=FONT_TITLE,
+
+        tk.Label(hdr, text="▶ YT-DLP", font=FONT_TITLE,
                  fg=ACCENT, bg=BG).pack(side="left")
-        tk.Label(hdr, text="  İndirici", font=FONT_TITLE,
+        tk.Label(hdr, text=" İndirici", font=FONT_TITLE,
                  fg=TEXT, bg=BG).pack(side="left")
 
-        # Sağ üst kontroller
         ctrl = tk.Frame(hdr, bg=BG)
         ctrl.pack(side="right")
 
-        # Otomatik indir toggle
         self.btn_auto = tk.Button(
             ctrl, text="⚡ OTO", font=FONT_SMALL,
             bg=ACCENT, fg="white", activebackground=ACCENT2,
@@ -63,7 +64,6 @@ class App(tk.Tk):
         )
         self.btn_auto.pack(side="left", padx=(0, 6))
 
-        # Her zaman üstte pin butonu
         self.btn_pin = tk.Button(
             ctrl, text="📌 ÜST", font=FONT_SMALL,
             bg=BORDER, fg=MUTED, activebackground=PIN_ON,
@@ -76,7 +76,7 @@ class App(tk.Tk):
         self._card_settings()
 
         self.btn_dl = tk.Button(
-            self, text="⬇  İNDİR", font=FONT_BTN,
+            self, text="⬇ İNDİR", font=FONT_BTN,
             bg=ACCENT, fg="white", activebackground=ACCENT2,
             activeforeground="white", bd=0, cursor="hand2",
             padx=0, pady=12, command=self._start_download
@@ -91,10 +91,13 @@ class App(tk.Tk):
     def _card_link(self):
         card = tk.Frame(self, bg=CARD, bd=0, pady=14, padx=20)
         card.pack(fill="x", padx=30, pady=(0, 8))
+
         tk.Label(card, text="VIDEO BAĞLANTISI", font=FONT_LABEL,
                  fg=MUTED, bg=CARD).pack(anchor="w")
+
         row = tk.Frame(card, bg=CARD)
         row.pack(fill="x", pady=(6, 0))
+
         self.url_var = tk.StringVar()
         self.entry = tk.Entry(
             row, textvariable=self.url_var, font=FONT_LABEL,
@@ -102,6 +105,7 @@ class App(tk.Tk):
             relief="flat", bd=8
         )
         self.entry.pack(side="left", fill="x", expand=True)
+
         tk.Button(
             row, text="YAPIŞTIR", font=FONT_SMALL,
             bg=BORDER, fg=MUTED, activebackground=ACCENT,
@@ -112,15 +116,19 @@ class App(tk.Tk):
     def _card_settings(self):
         card = tk.Frame(self, bg=CARD, pady=14, padx=20)
         card.pack(fill="x", padx=30, pady=(0, 8))
-        tk.Label(card, text="KAYIT KLASÖRü", font=FONT_LABEL,
+
+        tk.Label(card, text="KAYIT KLASÖRÜ", font=FONT_LABEL,
                  fg=MUTED, bg=CARD).pack(anchor="w")
+
         row = tk.Frame(card, bg=CARD)
         row.pack(fill="x", pady=(4, 10))
+
         tk.Entry(
             row, textvariable=self.download_dir, font=FONT_LABEL,
             bg="#252525", fg=TEXT, insertbackground=ACCENT,
             relief="flat", bd=8
         ).pack(side="left", fill="x", expand=True)
+
         tk.Button(
             row, text="SEÇ", font=FONT_SMALL,
             bg=BORDER, fg=MUTED, activebackground=ACCENT,
@@ -143,8 +151,8 @@ class App(tk.Tk):
 
         ck = tk.Frame(row2, bg=CARD)
         ck.pack(side="left", expand=True, fill="x")
-        tk.Label(ck, text="COOKIES DOSYASI (opsiyonel)", font=FONT_LABEL,
-                 fg=MUTED, bg=CARD).pack(anchor="w")
+        tk.Label(ck, text="COOKIES (boşsa Firefox'tan otomatik alınır)",
+                 font=FONT_LABEL, fg=MUTED, bg=CARD).pack(anchor="w")
         crow = tk.Frame(ck, bg=CARD)
         crow.pack(fill="x", pady=(4, 0))
         tk.Entry(
@@ -162,6 +170,7 @@ class App(tk.Tk):
     def _card_log(self):
         card = tk.Frame(self, bg=CARD, pady=10, padx=14)
         card.pack(fill="both", expand=True, padx=30, pady=(0, 6))
+
         header = tk.Frame(card, bg=CARD)
         header.pack(fill="x")
         tk.Label(header, text="ÇIKTI", font=FONT_LABEL,
@@ -173,13 +182,14 @@ class App(tk.Tk):
                   self.log.delete("1.0", "end") or
                   self.log.config(state="disabled")
                   ).pack(side="right")
+
         self.log = tk.Text(
             card, font=FONT_LOG, bg="#111111", fg="#aaaaaa",
             relief="flat", bd=0, state="disabled",
             height=9, wrap="word"
         )
         self.log.pack(fill="both", expand=True, pady=(6, 0))
-        self.log.tag_config("ok",  foreground=SUCCESS)
+        self.log.tag_config("ok", foreground=SUCCESS)
         self.log.tag_config("err", foreground=ACCENT)
         self.log.tag_config("inf", foreground="#aaaaff")
 
@@ -215,7 +225,6 @@ class App(tk.Tk):
                 self._last_clipboard = text
                 if text.startswith("http://") or text.startswith("https://"):
                     self.url_var.set(text)
-                    # Otomatik indir açıksa ve şu an indirme yoksa başlat
                     if self._auto_dl.get() and not self._is_downloading:
                         self._start_download()
         except Exception:
@@ -251,13 +260,25 @@ class App(tk.Tk):
                 return candidate
             i += 1
 
+    def _cookie_args(self, ck):
+        """
+        Kullanıcı elle bir cookies.txt seçtiyse onu kullan.
+        Seçmediyse, otomatik olarak Firefox tarayıcısının çerezlerini kullan.
+        Firefox, Chrome/Edge'deki App-Bound Encryption korumasını
+        kullanmadığı için yt-dlp çerezleri hiçbir eklentiye gerek
+        kalmadan doğrudan okuyabilir.
+        """
+        if ck:
+            return ["--cookies", ck]
+        return ["--cookies-from-browser", "firefox"]
+
     # ── İndirme ────────────────────────────────────────────────
     def _format_args(self, q):
         fmt = {
-            "best":           "bestvideo+bestaudio/best",
-            "1080p":          "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-            "720p":           "bestvideo[height<=720]+bestaudio/best[height<=720]",
-            "480p":           "bestvideo[height<=480]+bestaudio/best[height<=480]",
+            "best": "bestvideo+bestaudio/best",
+            "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+            "720p": "bestvideo[height<=720]+bestaudio/best[height<=720]",
+            "480p": "bestvideo[height<=480]+bestaudio/best[height<=480]",
             "ses only (mp3)": "bestaudio/best",
         }.get(q, "bestvideo+bestaudio/best")
         if q == "ses only (mp3)":
@@ -266,10 +287,10 @@ class App(tk.Tk):
 
     def _get_filename(self, url, q, ck):
         out = os.path.join(self.download_dir.get(), "%(title)s.%(ext)s")
-        cmd = ["yt-dlp", "--print", "filename", "--simulate", "-o", out]
+        cmd = ["yt-dlp", "--ignore-config", "--print", "filename",
+               "--simulate", "-o", out]
         cmd += self._format_args(q)
-        if ck:
-            cmd += ["--cookies", ck]
+        cmd += self._cookie_args(ck)
         cmd.append(url)
         try:
             result = subprocess.run(
@@ -292,11 +313,10 @@ class App(tk.Tk):
         if self._is_downloading:
             return
 
-        q  = self.quality.get()
+        q = self.quality.get()
         ck = self.cookies.get().strip()
-
         self._is_downloading = True
-        self.btn_dl.config(state="disabled", text="⏳  İNDİRİLİYOR...")
+        self.btn_dl.config(state="disabled", text="⏳ İNDİRİLİYOR...")
         self._write_log("▶ Dosya adı kontrol ediliyor...\n", "inf")
 
         def run():
@@ -306,17 +326,16 @@ class App(tk.Tk):
                     unique = self._unique_path(predicted)
                     if unique != predicted:
                         self.after(0, self._write_log,
-                            f"📋 Mevcut dosya var → {os.path.basename(unique)}\n", "inf")
+                                   f"📋 Mevcut dosya var → {os.path.basename(unique)}\n", "inf")
                     out_path = unique
                 else:
                     out_path = os.path.join(self.download_dir.get(), "%(title)s.%(ext)s")
 
                 self.after(0, self._write_log, "▶ İndirme başlıyor...\n\n", "inf")
 
-                cmd = ["yt-dlp"] + self._format_args(q)
+                cmd = ["yt-dlp", "--ignore-config"] + self._format_args(q)
                 cmd += ["-o", out_path]
-                if ck:
-                    cmd += ["--cookies", ck]
+                cmd += self._cookie_args(ck)
                 cmd.append(url)
 
                 proc = subprocess.Popen(
@@ -324,8 +343,8 @@ class App(tk.Tk):
                     text=True, encoding="utf-8", errors="replace"
                 )
                 for line in proc.stdout:
-                    tag = "ok"  if ("[download]" in line or "Destination" in line) \
-                         else "err" if "ERROR" in line else ""
+                    tag = "ok" if ("[download]" in line or "Destination" in line) \
+                        else "err" if "ERROR" in line else ""
                     self.after(0, self._write_log, line, tag)
                 proc.wait()
 
@@ -333,14 +352,13 @@ class App(tk.Tk):
                     self.after(0, self._write_log, "\n✅ İndirme tamamlandı!\n", "ok")
                 else:
                     self.after(0, self._write_log, "\n❌ İndirme başarısız.\n", "err")
-
             except FileNotFoundError:
                 self.after(0, self._write_log,
                            "❌ yt-dlp bulunamadı! PATH'e eklenmiş mi?\n", "err")
             finally:
                 self._is_downloading = False
                 self.after(0, lambda: self.btn_dl.config(
-                    state="normal", text="⬇  İNDİR"))
+                    state="normal", text="⬇ İNDİR"))
 
         threading.Thread(target=run, daemon=True).start()
 
