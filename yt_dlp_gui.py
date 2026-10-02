@@ -3,6 +3,7 @@ from tkinter import ttk, filedialog, messagebox
 import subprocess
 import threading
 import shlex
+import sys
 import queue
 import json
 import os
@@ -18,6 +19,41 @@ except Exception:
 
 # exe (--noconsole) olarak çalışırken yt-dlp için konsol penceresi açılmasın
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+# Bu programın başlattığı alt süreçlere işaret koyulur. Yanlışlıkla program
+# kendi kendini başlatırsa (yt-dlp yerine) hemen kapanır, pencere açmaz.
+GUARD_VAR = "YTDLP_GUI_CHILD"
+CHILD_ENV = dict(os.environ, **{GUARD_VAR: "1"})
+
+
+def find_ytdlp():
+    """
+    PATH içinde yt-dlp'yi bulur ve TAM YOLUNU döndürür.
+    Uygulamanın kendi exe'sini (adı yt-dlp.exe olsa bile) asla seçmez.
+    Windows'un 'uygulama klasörü / çalışma klasörü önce aranır' davranışına
+    güvenmemek için komut adı yerine tam yol kullanılır.
+    """
+    me = os.path.abspath(sys.executable)
+    if os.name == "nt":
+        names = ["yt-dlp.exe", "yt-dlp.cmd", "yt-dlp.bat"]
+    else:
+        names = ["yt-dlp"]
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        d = d.strip().strip('"')
+        if not d:
+            continue
+        for n in names:
+            p = os.path.join(d, n)
+            if not os.path.isfile(p):
+                continue
+            try:
+                if os.path.samefile(p, me):
+                    continue
+            except OSError:
+                pass
+            return p
+    return None
 
 
 def make_icon_image(size=64):
@@ -580,9 +616,9 @@ class App(tk.Tk):
             return ["-x", "--audio-format", "mp3"]
         return ["-f", fmt]
 
-    def _get_filename(self, url, q, ck, hdr_args):
+    def _get_filename(self, ytdlp, url, q, ck, hdr_args):
         out = os.path.join(self.download_dir.get(), "%(title)s.%(ext)s")
-        cmd = ["yt-dlp", "--ignore-config", "--print", "filename",
+        cmd = [ytdlp, "--ignore-config", "--print", "filename",
                "--simulate", "-o", out]
         cmd += self._format_args(q)
         cmd += self._cookie_args(ck)
@@ -592,7 +628,8 @@ class App(tk.Tk):
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
-                stdin=subprocess.DEVNULL, creationflags=NO_WINDOW
+                stdin=subprocess.DEVNULL, creationflags=NO_WINDOW,
+                env=CHILD_ENV
             )
             for l in reversed(result.stdout.strip().splitlines()):
                 l = l.strip()
@@ -613,6 +650,15 @@ class App(tk.Tk):
         q = self.quality.get()
         ck = self.cookies.get().strip()
         hdr_args = self._header_args(url)   # düz linklerde boş liste
+
+        ytdlp = find_ytdlp()
+        if not ytdlp:
+            self._write_log(
+                "❌ yt-dlp bulunamadı! PATH'te yt-dlp.exe olmalı "
+                "(bu programın kendi exe'si sayılmaz).\n", "err")
+            return
+        self._write_log(f"🔧 yt-dlp: {ytdlp}\n", "inf")
+
         self._is_downloading = True
         self.btn_dl.config(state="disabled", text="⏳ İNDİRİLİYOR...")
         self._write_log("▶ Dosya adı kontrol ediliyor...\n", "inf")
@@ -622,7 +668,7 @@ class App(tk.Tk):
 
         def run():
             try:
-                predicted = self._get_filename(url, q, ck, hdr_args)
+                predicted = self._get_filename(ytdlp, url, q, ck, hdr_args)
                 if predicted:
                     unique = self._unique_path(predicted)
                     if unique != predicted:
@@ -634,7 +680,7 @@ class App(tk.Tk):
 
                 self.after(0, self._write_log, "▶ İndirme başlıyor...\n\n", "inf")
 
-                cmd = ["yt-dlp", "--ignore-config"] + self._format_args(q)
+                cmd = [ytdlp, "--ignore-config"] + self._format_args(q)
                 cmd += ["-o", out_path]
                 cmd += self._cookie_args(ck)
                 cmd += hdr_args
@@ -643,6 +689,7 @@ class App(tk.Tk):
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL, creationflags=NO_WINDOW,
+                    env=CHILD_ENV,
                     text=True, encoding="utf-8", errors="replace"
                 )
                 for line in proc.stdout:
@@ -655,6 +702,11 @@ class App(tk.Tk):
                     self.after(0, self._write_log, "\n✅ İndirme tamamlandı!\n", "ok")
                     self._ui_q.put(("notify", "✅ İndirme tamamlandı"))
                 else:
+                    if proc.returncode == 3:
+                        self.after(0, self._write_log,
+                                   "\n⚠ yt-dlp yerine bu programın kendisi çalıştı. "
+                                   "Exe'nin adı 'yt-dlp.exe' olmasın ve PATH'teki "
+                                   "yt-dlp.exe'yi kontrol et.\n", "err")
                     self.after(0, self._write_log, "\n❌ İndirme başarısız.\n", "err")
                     self._ui_q.put(("notify", "❌ İndirme başarısız"))
             except FileNotFoundError:
@@ -669,5 +721,8 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    # Program yanlışlıkla kendi alt süreci olarak başlatıldıysa pencere açma
+    if os.environ.get(GUARD_VAR):
+        sys.exit(3)
     app = App()
     app.mainloop()
