@@ -2,7 +2,31 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import subprocess
 import threading
+import shlex
+import queue
+import json
 import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Sistem tepsisi desteği (pip install pystray pillow)
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    HAS_TRAY = True
+except Exception:
+    HAS_TRAY = False
+
+# exe (--noconsole) olarak çalışırken yt-dlp için konsol penceresi açılmasın
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def make_icon_image(size=64):
+    """Tepsi simgesi: kırmızı yuvarlak kare içinde beyaz oynat üçgeni."""
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(255, 68, 68, 255))
+    d.polygon([(24, 18), (24, 46), (48, 32)], fill=(255, 255, 255, 255))
+    return img.resize((size, size)) if size != 64 else img
 
 # ── Renkler & Font ──────────────────────────────────────────────
 BG = "#0f0f0f"
@@ -23,6 +47,82 @@ FONT_SMALL = ("Consolas", 8)
 
 DEFAULT_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
 
+# Eklentinin gönderebildiği başlıklar
+KNOWN_HEADERS = ("referer", "origin", "user-agent", "cookie")
+
+# Eklenti ile haberleşen yerel sunucu (sadece bu bilgisayardan erişilebilir)
+SERVER_PORT = 8765
+
+
+def make_handler(app):
+    """Eklentiden gelen istekleri alan HTTP işleyicisi."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass  # konsolu kirletme
+
+        def _allowed(self):
+            # DNS rebinding'e karşı Host kontrolü
+            host = self.headers.get("Host", "")
+            if host not in (f"127.0.0.1:{SERVER_PORT}", f"localhost:{SERVER_PORT}"):
+                return False
+            # Web siteleri Origin başlığını taklit edemez: sadece eklenti ya da
+            # tarayıcı dışı yerel istemciler (Origin yok) kabul edilir
+            origin = self.headers.get("Origin", "")
+            return origin == "" or origin.startswith("chrome-extension://")
+
+        def _send(self, code, obj):
+            body = json.dumps(obj).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            origin = self.headers.get("Origin", "")
+            if origin.startswith("chrome-extension://"):
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_OPTIONS(self):
+            if not self._allowed():
+                return self._send(403, {"ok": False, "error": "forbidden"})
+            self._send(200, {"ok": True})
+
+        def do_GET(self):
+            if not self._allowed():
+                return self._send(403, {"ok": False, "error": "forbidden"})
+            if self.path == "/ping":
+                return self._send(200, {"ok": True, "busy": app._is_downloading})
+            self._send(404, {"ok": False, "error": "not found"})
+
+        def do_POST(self):
+            if not self._allowed():
+                return self._send(403, {"ok": False, "error": "forbidden"})
+            if self.path != "/add":
+                return self._send(404, {"ok": False, "error": "not found"})
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+                if n <= 0 or n > 64 * 1024:
+                    return self._send(400, {"ok": False, "error": "bad size"})
+                data = json.loads(self.rfile.read(n).decode("utf-8"))
+                url = str(data.get("url", "")).strip()
+                if not (url.startswith("http://") or url.startswith("https://")):
+                    return self._send(400, {"ok": False, "error": "bad url"})
+                headers = {}
+                for k, v in (data.get("headers") or {}).items():
+                    if str(k).lower() in KNOWN_HEADERS and isinstance(v, str) and v:
+                        headers[str(k)] = v
+            except Exception:
+                return self._send(400, {"ok": False, "error": "bad request"})
+
+            if app._is_downloading:
+                return self._send(409, {"ok": False, "error": "busy"})
+            app._jobs.put((url, headers))
+            self._send(200, {"ok": True})
+
+    return Handler
+
 
 class App(tk.Tk):
     def __init__(self):
@@ -37,11 +137,26 @@ class App(tk.Tk):
         self.cookies = tk.StringVar(value="")
         self._last_clipboard = ""
         self._is_downloading = False
-        self._auto_dl = tk.BooleanVar(value=True)       # otomatik indir
+        self._auto_dl = tk.BooleanVar(value=False)      # otomatik indir (varsayılan KAPALI)
         self._always_top = tk.BooleanVar(value=False)   # her zaman üstte
 
+        # Eklentiden gelen ekstra başlıklar (sadece o URL için geçerli)
+        self._hdrs = {}
+        self._hdrs_url = ""
+
+        # Eklenti sunucusundan gelen işler
+        self._jobs = queue.Queue()
+
+        # Tepsi simgesi (başka iş parçacıklarından gelen arayüz komutları)
+        self._tray = None
+        self._ui_q = queue.Queue()
+        self.protocol("WM_DELETE_WINDOW", self._quit)
+
         self._build()
+        self._start_server()
         self._poll_clipboard()
+        self._poll_jobs()
+        self._poll_ui()
 
     # ── Arayüz ─────────────────────────────────────────────────
     def _build(self):
@@ -56,9 +171,18 @@ class App(tk.Tk):
         ctrl = tk.Frame(hdr, bg=BG)
         ctrl.pack(side="right")
 
+        self.btn_tray = tk.Button(
+            ctrl, text="🗕 KÜÇÜLT", font=FONT_SMALL,
+            bg=BORDER, fg=MUTED, activebackground=ACCENT,
+            activeforeground="white", bd=0, cursor="hand2",
+            padx=8, pady=5, command=self._to_tray
+        )
+        self.btn_tray.pack(side="left", padx=(0, 6))
+
+        # OTO varsayılan olarak kapalı başlar
         self.btn_auto = tk.Button(
             ctrl, text="⚡ OTO", font=FONT_SMALL,
-            bg=ACCENT, fg="white", activebackground=ACCENT2,
+            bg=BORDER, fg=MUTED, activebackground=ACCENT2,
             activeforeground="white", bd=0, cursor="hand2",
             padx=8, pady=5, command=self._toggle_auto
         )
@@ -210,21 +334,192 @@ class App(tk.Tk):
             self.attributes("-topmost", False)
             self.btn_pin.config(bg=BORDER, fg=MUTED, text="📌 ÜST")
 
+    # ── Sistem tepsisi ─────────────────────────────────────────
+    def _to_tray(self):
+        if not HAS_TRAY:
+            messagebox.showinfo(
+                "Tepsi desteği yok",
+                "Tepsiye küçültmek için şunu kurmalısın:\n\n"
+                "pip install pystray pillow")
+            return
+        if self._tray is None:
+            menu = pystray.Menu(
+                pystray.MenuItem("Göster", lambda: self._ui_q.put(("show", "")),
+                                 default=True),
+                pystray.MenuItem("Çıkış", lambda: self._ui_q.put(("quit", ""))),
+            )
+            self._tray = pystray.Icon(
+                "ytdlp_indirici", make_icon_image(), "yt-dlp İndirici", menu)
+            self._tray.run_detached()
+        self.withdraw()
+
+    def _from_tray(self):
+        if self._tray is not None:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
+            self._tray = None
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _quit(self):
+        if self._tray is not None:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
+            self._tray = None
+        self.destroy()
+
+    def _poll_ui(self):
+        """Tepsi menüsünden ve indirme iş parçacığından gelen komutlar."""
+        try:
+            while True:
+                cmd, arg = self._ui_q.get_nowait()
+                if cmd == "show":
+                    self._from_tray()
+                elif cmd == "quit":
+                    self._quit()
+                    return
+                elif cmd == "notify" and self._tray is not None:
+                    try:
+                        self._tray.notify(arg, "yt-dlp İndirici")
+                    except Exception:
+                        pass
+        except queue.Empty:
+            pass
+        self.after(200, self._poll_ui)
+
+    # ── Eklenti sunucusu ───────────────────────────────────────
+    def _start_server(self):
+        try:
+            self._server = ThreadingHTTPServer(
+                ("127.0.0.1", SERVER_PORT), make_handler(self))
+            threading.Thread(target=self._server.serve_forever,
+                             daemon=True).start()
+            self._write_log(
+                f"🌐 Eklenti bağlantısı hazır (127.0.0.1:{SERVER_PORT})\n", "inf")
+        except OSError:
+            self._server = None
+            self._write_log(
+                f"⚠ {SERVER_PORT} portu kullanımda, eklentiden gönderme çalışmaz. "
+                "Aracın başka bir kopyası açık olabilir.\n", "err")
+
+    def _poll_jobs(self):
+        """Eklentiden 'Araca gönder' ile gelen işleri al ve indir."""
+        if not self._is_downloading:
+            try:
+                url, hdrs = self._jobs.get_nowait()
+                self._set_url(url, hdrs)
+                self._start_download()
+            except queue.Empty:
+                pass
+        self.after(300, self._poll_jobs)
+
+    # ── Pano / başlık ayrıştırma ───────────────────────────────
+    def _parse_clip(self, text):
+        """
+        Pano metnini (url, başlıklar) olarak ayırır.
+        Düz link  -> (link, {})            (eski davranışla aynı)
+        Eklenti   -> ilk satır link, sonraki satırlar 'Referer: ...' gibi.
+        'yt-dlp ...' komutu da çözülür.
+        http ile başlamıyorsa (None, {}) döner.
+        """
+        text = text.strip()
+
+        if text.startswith("yt-dlp "):
+            return self._parse_command(text)
+
+        if not (text.startswith("http://") or text.startswith("https://")):
+            return None, {}
+
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if len(lines) == 1:
+            return lines[0], {}
+
+        headers = {}
+        for l in lines[1:]:
+            name, sep, val = l.partition(":")
+            if sep and name.strip().lower() in KNOWN_HEADERS:
+                headers[name.strip()] = val.strip()
+        return lines[0], headers
+
+    def _parse_command(self, text):
+        """'yt-dlp --referer "..." ... "URL"' metninden (url, başlıklar) çıkarır."""
+        try:
+            toks = shlex.split(text)
+        except ValueError:
+            return None, {}
+
+        url = None
+        headers = {}
+        i = 1
+        while i < len(toks):
+            t = toks[i]
+            nxt = toks[i + 1] if i + 1 < len(toks) else ""
+            if t == "--referer":
+                headers["Referer"] = nxt
+                i += 2
+            elif t == "--user-agent":
+                headers["User-Agent"] = nxt
+                i += 2
+            elif t == "--add-header":
+                name, sep, val = nxt.partition(":")
+                if sep and name.strip().lower() in KNOWN_HEADERS:
+                    headers[name.strip()] = val.strip()
+                i += 2
+            elif t.startswith(("http://", "https://")):
+                url = t
+                i += 1
+            else:
+                i += 1
+        if not url:
+            return None, {}
+        return url, headers
+
+    def _set_url(self, url, headers):
+        self.url_var.set(url)
+        self._hdrs = headers
+        self._hdrs_url = url if headers else ""
+
+    def _header_args(self, url):
+        """Başlıklar sadece eklentiden gelen URL ile aynı URL için kullanılır."""
+        if not self._hdrs or url != self._hdrs_url:
+            return []
+        args = []
+        for name, val in self._hdrs.items():
+            n = name.lower()
+            if n == "referer":
+                args += ["--referer", val]
+            elif n == "user-agent":
+                args += ["--user-agent", val]
+            else:
+                args += ["--add-header", f"{name}: {val}"]
+        return args
+
     # ── Yardımcılar ────────────────────────────────────────────
     def _paste(self):
         try:
-            self.url_var.set(self.clipboard_get())
+            url, hdrs = self._parse_clip(self.clipboard_get())
+            if url:
+                self._set_url(url, hdrs)
+            else:
+                self._set_url(self.clipboard_get(), {})
         except Exception:
             pass
 
     def _poll_clipboard(self):
         """Her 500ms'de panoyu kontrol et; yeni link varsa yapıştır ve gerekirse indir."""
         try:
-            text = self.clipboard_get().strip()
+            raw = self.clipboard_get()
+            text = raw.strip()
             if text != self._last_clipboard:
                 self._last_clipboard = text
-                if text.startswith("http://") or text.startswith("https://"):
-                    self.url_var.set(text)
+                url, hdrs = self._parse_clip(text)
+                if url:
+                    self._set_url(url, hdrs)
                     if self._auto_dl.get() and not self._is_downloading:
                         self._start_download()
         except Exception:
@@ -285,17 +580,19 @@ class App(tk.Tk):
             return ["-x", "--audio-format", "mp3"]
         return ["-f", fmt]
 
-    def _get_filename(self, url, q, ck):
+    def _get_filename(self, url, q, ck, hdr_args):
         out = os.path.join(self.download_dir.get(), "%(title)s.%(ext)s")
         cmd = ["yt-dlp", "--ignore-config", "--print", "filename",
                "--simulate", "-o", out]
         cmd += self._format_args(q)
         cmd += self._cookie_args(ck)
+        cmd += hdr_args
         cmd.append(url)
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
-                encoding="utf-8", errors="replace"
+                encoding="utf-8", errors="replace",
+                stdin=subprocess.DEVNULL, creationflags=NO_WINDOW
             )
             for l in reversed(result.stdout.strip().splitlines()):
                 l = l.strip()
@@ -315,13 +612,17 @@ class App(tk.Tk):
 
         q = self.quality.get()
         ck = self.cookies.get().strip()
+        hdr_args = self._header_args(url)   # düz linklerde boş liste
         self._is_downloading = True
         self.btn_dl.config(state="disabled", text="⏳ İNDİRİLİYOR...")
         self._write_log("▶ Dosya adı kontrol ediliyor...\n", "inf")
+        if hdr_args:
+            names = ", ".join(self._hdrs.keys())
+            self._write_log(f"🔑 Eklentiden gelen başlıklar kullanılıyor: {names}\n", "inf")
 
         def run():
             try:
-                predicted = self._get_filename(url, q, ck)
+                predicted = self._get_filename(url, q, ck, hdr_args)
                 if predicted:
                     unique = self._unique_path(predicted)
                     if unique != predicted:
@@ -336,10 +637,12 @@ class App(tk.Tk):
                 cmd = ["yt-dlp", "--ignore-config"] + self._format_args(q)
                 cmd += ["-o", out_path]
                 cmd += self._cookie_args(ck)
+                cmd += hdr_args
                 cmd.append(url)
 
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL, creationflags=NO_WINDOW,
                     text=True, encoding="utf-8", errors="replace"
                 )
                 for line in proc.stdout:
@@ -350,8 +653,10 @@ class App(tk.Tk):
 
                 if proc.returncode == 0:
                     self.after(0, self._write_log, "\n✅ İndirme tamamlandı!\n", "ok")
+                    self._ui_q.put(("notify", "✅ İndirme tamamlandı"))
                 else:
                     self.after(0, self._write_log, "\n❌ İndirme başarısız.\n", "err")
+                    self._ui_q.put(("notify", "❌ İndirme başarısız"))
             except FileNotFoundError:
                 self.after(0, self._write_log,
                            "❌ yt-dlp bulunamadı! PATH'e eklenmiş mi?\n", "err")
