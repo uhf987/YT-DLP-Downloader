@@ -3,6 +3,7 @@ from tkinter import ttk, filedialog, messagebox
 import subprocess
 import threading
 import shlex
+import shutil
 import sys
 import queue
 import json
@@ -89,6 +90,16 @@ KNOWN_HEADERS = ("referer", "origin", "user-agent", "cookie")
 # Eklenti ile haberleşen yerel sunucu (sadece bu bilgisayardan erişilebilir)
 SERVER_PORT = 8765
 
+# İndirme hızı modları: (yt-dlp -N parça sayısı, aria2c kullanılsın mı)
+#  -N  : HLS/DASH (m3u8/mpd) parçalarını aynı anda N bağlantıyla indirir
+#  aria2c : düz dosyaları (mp4 vb.) çok bağlantıyla bölerek indirir, IDM'e en yakın yöntem
+SPEED_MODES = {
+    "Normal (tek bağlantı)": (1, False),
+    "Hızlı (8 parça aynı anda)": (8, False),
+    "Çok hızlı (16 parça + aria2c varsa)": (16, True),
+}
+SPEED_DEFAULT = "Hızlı (8 parça aynı anda)"
+
 
 def make_handler(app):
     """Eklentiden gelen istekleri alan HTTP işleyicisi."""
@@ -164,13 +175,14 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("yt-dlp İndirici")
-        self.geometry("680x600")
+        self.geometry("680x660")
         self.resizable(False, False)
         self.configure(bg=BG)
 
         self.download_dir = tk.StringVar(value=DEFAULT_DIR)
         self.quality = tk.StringVar(value="best")
         self.cookies = tk.StringVar(value="")
+        self.speed = tk.StringVar(value=SPEED_DEFAULT)
         self._last_clipboard = ""
         self._is_downloading = False
         self._auto_dl = tk.BooleanVar(value=False)      # otomatik indir (varsayılan KAPALI)
@@ -326,6 +338,15 @@ class App(tk.Tk):
             activeforeground="white", bd=0, cursor="hand2",
             padx=8, pady=8, command=self._choose_cookies
         ).pack(side="left", padx=(4, 0))
+
+        row3 = tk.Frame(card, bg=CARD)
+        row3.pack(fill="x", pady=(10, 0))
+        tk.Label(row3, text="İNDİRME HIZI (IDM gibi parçalı indirme)",
+                 font=FONT_LABEL, fg=MUTED, bg=CARD).pack(anchor="w")
+        ttk.Combobox(
+            row3, textvariable=self.speed, font=FONT_LABEL,
+            state="readonly", width=44, values=list(SPEED_MODES.keys())
+        ).pack(anchor="w", pady=(4, 0))
 
     def _card_log(self):
         card = tk.Frame(self, bg=CARD, pady=10, padx=14)
@@ -616,6 +637,29 @@ class App(tk.Tk):
             return ["-x", "--audio-format", "mp3"]
         return ["-f", fmt]
 
+    def _speed_args(self):
+        """
+        Seçilen hız moduna göre yt-dlp argümanları ve log mesajı döndürür.
+        -N: HLS/DASH parçalarını paralel indirir (m3u8/mpd için asıl hızlandırma).
+        aria2c: PATH'te varsa düz dosyaları çok bağlantıyla indirir; m3u8/mpd
+        için yt-dlp'nin kendi indiricisi kalır (daha güvenilir).
+        """
+        n, want_aria = SPEED_MODES.get(self.speed.get(), SPEED_MODES[SPEED_DEFAULT])
+        if n <= 1:
+            return [], "Hız: normal (tek bağlantı)"
+        args = ["-N", str(n)]
+        msg = f"Hız: {n} parça aynı anda"
+        if want_aria:
+            aria = shutil.which("aria2c")
+            if aria:
+                args += ["--downloader", "aria2c",
+                         "--downloader", "dash,m3u8:native",
+                         "--downloader-args", "aria2c:-x16 -s16 -k1M"]
+                msg += " + aria2c (düz dosyalar için)"
+            else:
+                msg += " (aria2c bulunamadı, sadece parçalı indirme)"
+        return args, msg
+
     def _get_filename(self, ytdlp, url, q, ck, hdr_args):
         out = os.path.join(self.download_dir.get(), "%(title)s.%(ext)s")
         cmd = [ytdlp, "--ignore-config", "--print", "filename",
@@ -650,6 +694,7 @@ class App(tk.Tk):
         q = self.quality.get()
         ck = self.cookies.get().strip()
         hdr_args = self._header_args(url)   # düz linklerde boş liste
+        speed_args, speed_msg = self._speed_args()
 
         ytdlp = find_ytdlp()
         if not ytdlp:
@@ -658,6 +703,7 @@ class App(tk.Tk):
                 "(bu programın kendi exe'si sayılmaz).\n", "err")
             return
         self._write_log(f"🔧 yt-dlp: {ytdlp}\n", "inf")
+        self._write_log(f"⚡ {speed_msg}\n", "inf")
 
         self._is_downloading = True
         self.btn_dl.config(state="disabled", text="⏳ İNDİRİLİYOR...")
@@ -684,6 +730,7 @@ class App(tk.Tk):
                 cmd += ["-o", out_path]
                 cmd += self._cookie_args(ck)
                 cmd += hdr_args
+                cmd += speed_args
                 cmd.append(url)
 
                 proc = subprocess.Popen(
