@@ -4,10 +4,13 @@ import subprocess
 import threading
 import shlex
 import shutil
+import re
 import sys
 import queue
 import json
 import os
+import time
+from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Sistem tepsisi desteği (pip install pystray pillow)
@@ -57,6 +60,65 @@ def find_ytdlp():
     return None
 
 
+# ── Kuyruk durumları ───────────────────────────────────────────
+ST_WAIT = "bekliyor"
+ST_RUN = "indiriliyor"
+ST_MERGE = "birleştiriliyor"
+ST_DONE = "tamamlandı"
+ST_ERR = "hata"
+ST_CANCEL = "iptal edildi"
+ACTIVE = (ST_WAIT, ST_RUN, ST_MERGE)
+STATUS_TAG = {ST_WAIT: "wait", ST_RUN: "run", ST_MERGE: "merge",
+              ST_DONE: "done", ST_ERR: "err", ST_CANCEL: "cancel"}
+
+# yt-dlp ilerleme satırları:  [download]  42.3% of 100.00MiB at 5.00MiB/s ETA 00:12
+PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
+SPEED_RE = re.compile(r"\bat\s+(\S+/s)")
+ETA_RE = re.compile(r"ETA\s+(\S+)")
+# aria2c ilerleme satırları:  [#a1b2c3 3.2MiB/10MiB(32%) CN:16 DL:2.1MiB ETA:3s]
+ARIA_RE = re.compile(r"\[#\w+\s+[\d.]+\w*/[\d.]+\w*\((\d+)%\)")
+ARIA_DL_RE = re.compile(r"DL:([^\s\]]+)")
+ARIA_ETA_RE = re.compile(r"ETA:([^\s\]]+)")
+MERGE_PREFIXES = ("[Merger]", "[ExtractAudio]", "[VideoRemuxer]", "[FixupM3u8]",
+                  "[FixupM4a]", "[FixupStretched]", "[FixupTimestamp]")
+
+
+def kill_tree(proc):
+    """İndirmeyi ve onun başlattığı ffmpeg/aria2c süreçlerini sonlandırır."""
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        else:
+            proc.terminate()
+    except Exception:
+        pass
+
+
+def short(text, n):
+    text = str(text)
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def nice_title(url):
+    """Dosya adı henüz bilinmiyorsa listede görünecek kısa ad: alanadı/son-parça."""
+    try:
+        u = urlparse(url)
+        tail = u.path.rstrip("/").split("/")[-1]
+        return (u.netloc + "/" + tail) if tail else (u.netloc or url)
+    except Exception:
+        return url
+
+
+def bar_text(pct, width=10):
+    """Listede görünen metin tabanlı ilerleme çubuğu."""
+    pct = max(0.0, min(100.0, float(pct)))
+    filled = int(round(width * pct / 100.0))
+    return "█" * filled + "░" * (width - filled) + f" {pct:3.0f}%"
+
+
 def make_icon_image(size=64):
     """Tepsi simgesi: kırmızı yuvarlak kare içinde beyaz oynat üçgeni."""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -75,6 +137,7 @@ MUTED = "#666666"
 SUCCESS = "#44ff88"
 BORDER = "#2a2a2a"
 PIN_ON = "#ffcc00"
+QUEUE_BG = "#111111"
 
 FONT_TITLE = ("Consolas", 22, "bold")
 FONT_LABEL = ("Consolas", 10)
@@ -140,7 +203,14 @@ def make_handler(app):
             if not self._allowed():
                 return self._send(403, {"ok": False, "error": "forbidden"})
             if self.path == "/ping":
-                return self._send(200, {"ok": True, "busy": app._is_downloading})
+                try:
+                    jobs = list(app._jobs_list)
+                    running = sum(1 for j in jobs if j["status"] in (ST_RUN, ST_MERGE))
+                    waiting = sum(1 for j in jobs if j["status"] == ST_WAIT)
+                except Exception:
+                    running = waiting = 0
+                return self._send(200, {"ok": True, "busy": running > 0,
+                                        "running": running, "waiting": waiting})
             self._send(404, {"ok": False, "error": "not found"})
 
         def do_POST(self):
@@ -163,10 +233,9 @@ def make_handler(app):
             except Exception:
                 return self._send(400, {"ok": False, "error": "bad request"})
 
-            if app._is_downloading:
-                return self._send(409, {"ok": False, "error": "busy"})
+            # Meşgul olsa bile kabul edilir: iş kuyruğa eklenir
             app._jobs.put((url, headers))
-            self._send(200, {"ok": True})
+            self._send(200, {"ok": True, "queued": True})
 
     return Handler
 
@@ -175,8 +244,9 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("yt-dlp İndirici")
-        self.geometry("680x660")
-        self.resizable(False, False)
+        self.geometry("700x860")
+        self.resizable(True, True)
+        self.minsize(680, 720)
         self.configure(bg=BG)
 
         self.download_dir = tk.StringVar(value=DEFAULT_DIR)
@@ -184,9 +254,14 @@ class App(tk.Tk):
         self.cookies = tk.StringVar(value="")
         self.speed = tk.StringVar(value=SPEED_DEFAULT)
         self._last_clipboard = ""
-        self._is_downloading = False
         self._auto_dl = tk.BooleanVar(value=False)      # otomatik indir (varsayılan KAPALI)
         self._always_top = tk.BooleanVar(value=False)   # her zaman üstte
+
+        # İndirme kuyruğu
+        self._jobs_list = []            # arayüzde görünen işler (sadece ana iş parçacığı değiştirir)
+        self._pending = queue.Queue()   # indirme iş parçacığının sırası
+        self._next_id = 0
+        self._logged_ytdlp = None
 
         # Eklentiden gelen ekstra başlıklar (sadece o URL için geçerli)
         self._hdrs = {}
@@ -205,6 +280,8 @@ class App(tk.Tk):
         self._poll_clipboard()
         self._poll_jobs()
         self._poll_ui()
+        self._refresh_tree()
+        threading.Thread(target=self._worker_loop, daemon=True).start()
 
     # ── Arayüz ─────────────────────────────────────────────────
     def _build(self):
@@ -255,10 +332,12 @@ class App(tk.Tk):
         )
         self.btn_dl.pack(fill="x", padx=30, pady=(4, 10))
 
-        self._card_log()
-
+        # Sabit boyutlu alt kısımlar önce (aşağıya) yerleşir; pencere küçülürse
+        # sıkışan taraf kuyruk listesi olur, çıktı kutusu ve alt yazı değil.
         tk.Label(self, text="yt-dlp sistemde kurulu olmalıdır",
-                 font=FONT_SMALL, fg=MUTED, bg=BG).pack(pady=(0, 8))
+                 font=FONT_SMALL, fg=MUTED, bg=BG).pack(side="bottom", pady=(0, 8))
+        self._card_log()
+        self._card_queue()
 
     def _card_link(self):
         card = tk.Frame(self, bg=CARD, bd=0, pady=14, padx=20)
@@ -348,9 +427,78 @@ class App(tk.Tk):
             state="readonly", width=44, values=list(SPEED_MODES.keys())
         ).pack(anchor="w", pady=(4, 0))
 
+    def _card_queue(self):
+        card = tk.Frame(self, bg=CARD, pady=10, padx=14)
+        card.pack(fill="both", expand=True, padx=30, pady=(0, 8))
+
+        head = tk.Frame(card, bg=CARD)
+        head.pack(fill="x")
+        tk.Label(head, text="KUYRUK", font=FONT_LABEL,
+                 fg=MUTED, bg=CARD).pack(side="left")
+
+        # Sağdan sola dizildiği için ters sırayla ekleniyor
+        for text, cmd in reversed([
+            ("⏹ İPTAL", self._cancel_selected),
+            ("↻ TEKRAR", self._retry_selected),
+            ("✕ KALDIR", self._remove_selected),
+            ("🧹 BİTENLER", self._clear_finished),
+            ("📂 KLASÖR", self._open_selected_folder),
+        ]):
+            tk.Button(head, text=text, font=FONT_SMALL, bg=BORDER, fg=MUTED,
+                      activebackground=ACCENT, activeforeground="white",
+                      bd=0, cursor="hand2", padx=6, pady=3, command=cmd
+                      ).pack(side="right", padx=(4, 0))
+
+        # Durum özeti ayrı satırda: uzun metin düğmeleri sıkıştırıp kesmesin
+        self.lbl_queue = tk.Label(card, text="Kuyruk boş", font=FONT_SMALL,
+                                  fg=MUTED, bg=CARD, anchor="w")
+        self.lbl_queue.pack(fill="x", pady=(4, 0))
+
+        style = ttk.Style(self)
+        style.configure("Q.Treeview", background=QUEUE_BG, fieldbackground=QUEUE_BG,
+                        foreground=TEXT, rowheight=24, borderwidth=0, font=FONT_LOG)
+        style.map("Q.Treeview",
+                  background=[("selected", "#333333")],
+                  foreground=[("selected", TEXT)])
+        style.configure("Q.Treeview.Heading", background=BORDER, foreground=MUTED,
+                        font=FONT_SMALL, relief="flat")
+
+        wrap = tk.Frame(card, bg=QUEUE_BG)
+        wrap.pack(fill="both", expand=True, pady=(8, 0))
+
+        cols = ("name", "status", "progress", "speed", "eta")
+        heads = ("DOSYA", "DURUM", "İLERLEME", "HIZ", "KALAN")
+        widths = (190, 110, 140, 85, 60)
+        self.tree = ttk.Treeview(wrap, columns=cols, show="headings",
+                                 selectmode="extended", height=6,
+                                 style="Q.Treeview")
+        for c, h, w in zip(cols, heads, widths):
+            self.tree.heading(c, text=h, anchor="w")
+            self.tree.column(c, width=w, minwidth=40, anchor="w",
+                             stretch=(c == "name"))
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        for tag, color in (("wait", "#aaaaaa"), ("run", TEXT), ("merge", ACCENT2),
+                           ("done", SUCCESS), ("err", ACCENT), ("cancel", MUTED)):
+            self.tree.tag_configure(tag, foreground=color)
+
+        # Sağ tık menüsü ve Delete tuşu
+        self.qmenu = tk.Menu(self, tearoff=0, bg=CARD, fg=TEXT,
+                             activebackground=ACCENT, activeforeground="white", bd=0)
+        self.qmenu.add_command(label="⏹ İptal", command=self._cancel_selected)
+        self.qmenu.add_command(label="↻ Yeniden dene", command=self._retry_selected)
+        self.qmenu.add_command(label="✕ Listeden kaldır", command=self._remove_selected)
+        self.qmenu.add_separator()
+        self.qmenu.add_command(label="📂 Klasörü aç", command=self._open_selected_folder)
+        self.tree.bind("<Button-3>", self._on_tree_rightclick)
+        self.tree.bind("<Delete>", lambda e: self._remove_selected())
+
     def _card_log(self):
         card = tk.Frame(self, bg=CARD, pady=10, padx=14)
-        card.pack(fill="both", expand=True, padx=30, pady=(0, 6))
+        card.pack(side="bottom", fill="x", padx=30, pady=(0, 6))
 
         header = tk.Frame(card, bg=CARD)
         header.pack(fill="x")
@@ -367,9 +515,9 @@ class App(tk.Tk):
         self.log = tk.Text(
             card, font=FONT_LOG, bg="#111111", fg="#aaaaaa",
             relief="flat", bd=0, state="disabled",
-            height=9, wrap="word"
+            height=5, wrap="word"
         )
-        self.log.pack(fill="both", expand=True, pady=(6, 0))
+        self.log.pack(fill="x", pady=(6, 0))
         self.log.tag_config("ok", foreground=SUCCESS)
         self.log.tag_config("err", foreground=ACCENT)
         self.log.tag_config("inf", foreground="#aaaaff")
@@ -421,7 +569,24 @@ class App(tk.Tk):
         self.lift()
         self.focus_force()
 
+    def _notify(self, text):
+        """Pencere tepsideyken küçük bir bildirim gösterir."""
+        if self._tray is not None:
+            try:
+                self._tray.notify(text, "yt-dlp İndirici")
+            except Exception:
+                pass
+
     def _quit(self):
+        active = [j for j in self._jobs_list if j["status"] in ACTIVE]
+        if active and not messagebox.askyesno(
+                "Çıkış", f"{len(active)} indirme sürüyor ya da bekliyor.\n"
+                         "Yine de çıkılsın mı?"):
+            return
+        for j in self._jobs_list:
+            if j.get("proc"):
+                j["cancel"] = True
+                kill_tree(j["proc"])
         if self._tray is not None:
             try:
                 self._tray.stop()
@@ -432,21 +597,27 @@ class App(tk.Tk):
 
     def _poll_ui(self):
         """Tepsi menüsünden ve indirme iş parçacığından gelen komutlar."""
+        dirty = False
         try:
             while True:
                 cmd, arg = self._ui_q.get_nowait()
                 if cmd == "show":
                     self._from_tray()
                 elif cmd == "quit":
-                    self._quit()
-                    return
-                elif cmd == "notify" and self._tray is not None:
-                    try:
-                        self._tray.notify(arg, "yt-dlp İndirici")
-                    except Exception:
-                        pass
+                    self.after(0, self._quit)
+                elif cmd == "notify":
+                    self._notify(arg)
+                elif cmd == "log":
+                    self._write_log(*arg)
+                elif cmd == "refresh":
+                    dirty = True
+                elif cmd == "done":
+                    dirty = True
+                    self._on_job_done(arg)
         except queue.Empty:
             pass
+        if dirty:
+            self._refresh_tree()
         self.after(200, self._poll_ui)
 
     # ── Eklenti sunucusu ───────────────────────────────────────
@@ -465,14 +636,13 @@ class App(tk.Tk):
                 "Aracın başka bir kopyası açık olabilir.\n", "err")
 
     def _poll_jobs(self):
-        """Eklentiden 'Araca gönder' ile gelen işleri al ve indir."""
-        if not self._is_downloading:
-            try:
+        """Eklentiden 'Araca gönder' ile gelen işleri kuyruğa ekle."""
+        try:
+            while True:
                 url, hdrs = self._jobs.get_nowait()
-                self._set_url(url, hdrs)
-                self._start_download()
-            except queue.Empty:
-                pass
+                self._enqueue(url, hdrs)
+        except queue.Empty:
+            pass
         self.after(300, self._poll_jobs)
 
     # ── Pano / başlık ayrıştırma ───────────────────────────────
@@ -541,12 +711,10 @@ class App(tk.Tk):
         self._hdrs = headers
         self._hdrs_url = url if headers else ""
 
-    def _header_args(self, url):
-        """Başlıklar sadece eklentiden gelen URL ile aynı URL için kullanılır."""
-        if not self._hdrs or url != self._hdrs_url:
-            return []
+    def _header_args(self, headers):
+        """Bir işin başlıklarını yt-dlp argümanlarına çevirir (düz linklerde boş)."""
         args = []
-        for name, val in self._hdrs.items():
+        for name, val in (headers or {}).items():
             n = name.lower()
             if n == "referer":
                 args += ["--referer", val]
@@ -568,7 +736,7 @@ class App(tk.Tk):
             pass
 
     def _poll_clipboard(self):
-        """Her 500ms'de panoyu kontrol et; yeni link varsa yapıştır ve gerekirse indir."""
+        """Her 500ms'de panoyu kontrol et; yeni link varsa yapıştır ve gerekirse kuyruğa ekle."""
         try:
             raw = self.clipboard_get()
             text = raw.strip()
@@ -577,8 +745,8 @@ class App(tk.Tk):
                 url, hdrs = self._parse_clip(text)
                 if url:
                     self._set_url(url, hdrs)
-                    if self._auto_dl.get() and not self._is_downloading:
-                        self._start_download()
+                    if self._auto_dl.get():
+                        self._start_download()   # kuyruğa ekler (aynı link iki kez eklenmez)
         except Exception:
             pass
         self.after(500, self._poll_clipboard)
@@ -624,7 +792,7 @@ class App(tk.Tk):
             return ["--cookies", ck]
         return ["--cookies-from-browser", "firefox"]
 
-    # ── İndirme ────────────────────────────────────────────────
+    # ── İndirme argümanları ────────────────────────────────────
     def _format_args(self, q):
         fmt = {
             "best": "bestvideo+bestaudio/best",
@@ -637,14 +805,14 @@ class App(tk.Tk):
             return ["-x", "--audio-format", "mp3"]
         return ["-f", fmt]
 
-    def _speed_args(self):
+    def _speed_args(self, mode):
         """
         Seçilen hız moduna göre yt-dlp argümanları ve log mesajı döndürür.
         -N: HLS/DASH parçalarını paralel indirir (m3u8/mpd için asıl hızlandırma).
         aria2c: PATH'te varsa düz dosyaları çok bağlantıyla indirir; m3u8/mpd
         için yt-dlp'nin kendi indiricisi kalır (daha güvenilir).
         """
-        n, want_aria = SPEED_MODES.get(self.speed.get(), SPEED_MODES[SPEED_DEFAULT])
+        n, want_aria = SPEED_MODES.get(mode, SPEED_MODES[SPEED_DEFAULT])
         if n <= 1:
             return [], "Hız: normal (tek bağlantı)"
         args = ["-N", str(n)]
@@ -660,111 +828,375 @@ class App(tk.Tk):
                 msg += " (aria2c bulunamadı, sadece parçalı indirme)"
         return args, msg
 
-    def _get_filename(self, ytdlp, url, q, ck, hdr_args):
-        out = os.path.join(self.download_dir.get(), "%(title)s.%(ext)s")
-        cmd = [ytdlp, "--ignore-config", "--print", "filename",
-               "--simulate", "-o", out]
-        cmd += self._format_args(q)
-        cmd += self._cookie_args(ck)
-        cmd += hdr_args
-        cmd.append(url)
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True,
-                encoding="utf-8", errors="replace",
-                stdin=subprocess.DEVNULL, creationflags=NO_WINDOW,
-                env=CHILD_ENV
-            )
-            for l in reversed(result.stdout.strip().splitlines()):
-                l = l.strip()
-                if l and not l.startswith("["):
-                    return l
-        except Exception:
-            pass
-        return None
-
+    # ── Kuyruk ─────────────────────────────────────────────────
     def _start_download(self):
+        """İNDİR düğmesi / OTO: kutudaki bağlantıyı kuyruğa ekler."""
         url = self.url_var.get().strip()
         if not url:
             messagebox.showerror("Hata", "Lütfen bir bağlantı girin.")
             return
-        if self._is_downloading:
-            return
+        hdrs = self._hdrs if url == self._hdrs_url else {}
+        self._enqueue(url, hdrs)
 
-        q = self.quality.get()
-        ck = self.cookies.get().strip()
-        hdr_args = self._header_args(url)   # düz linklerde boş liste
-        speed_args, speed_msg = self._speed_args()
+    def _enqueue(self, url, headers=None):
+        """
+        Yeni bir iş oluşturur ve kuyruğa ekler. İşin ayarları (kalite, hız,
+        klasör, cookies, başlıklar) eklendiği andaki değerlerle saklanır;
+        sonradan değiştirmek kuyruktaki işleri etkilemez.
+        """
+        url = url.strip()
+        headers = dict(headers or {})
+        for j in self._jobs_list:
+            if j["url"] == url and j["status"] in ACTIVE:
+                self._write_log("↪ Bu bağlantı zaten kuyrukta, atlandı.\n", "inf")
+                return None
 
-        ytdlp = find_ytdlp()
-        if not ytdlp:
-            self._write_log(
-                "❌ yt-dlp bulunamadı! PATH'te yt-dlp.exe olmalı "
-                "(bu programın kendi exe'si sayılmaz).\n", "err")
-            return
-        self._write_log(f"🔧 yt-dlp: {ytdlp}\n", "inf")
-        self._write_log(f"⚡ {speed_msg}\n", "inf")
+        self._next_id += 1
+        job = {
+            "id": self._next_id, "url": url, "headers": headers,
+            "quality": self.quality.get(), "cookies": self.cookies.get().strip(),
+            "speed": self.speed.get(), "outdir": self.download_dir.get(),
+            "status": ST_WAIT, "percent": 0.0, "speed_txt": "", "eta": "",
+            "title": nice_title(url), "msg": "", "note": "", "stage": 0,
+            "proc": None, "cancel": False, "out_path": "",
+        }
+        self._jobs_list.append(job)
+        self._pending.put(job)
+        extra = f" (başlıklar: {', '.join(headers)})" if headers else ""
+        self._write_log(f"➕ [#{job['id']}] Kuyruğa eklendi: {short(url, 80)}{extra}\n", "inf")
+        self._refresh_tree()
+        return job
 
-        self._is_downloading = True
-        self.btn_dl.config(state="disabled", text="⏳ İNDİRİLİYOR...")
-        self._write_log("▶ Dosya adı kontrol ediliyor...\n", "inf")
-        if hdr_args:
-            names = ", ".join(self._hdrs.keys())
-            self._write_log(f"🔑 Eklentiden gelen başlıklar kullanılıyor: {names}\n", "inf")
-
-        def run():
+    def _worker_loop(self):
+        """Kuyruktaki işleri sırayla indirir (aynı anda tek indirme)."""
+        while True:
+            job = self._pending.get()
+            if job["status"] != ST_WAIT:
+                continue   # iptal edilmiş, kaldırılmış ya da zaten çalışmış
             try:
-                predicted = self._get_filename(ytdlp, url, q, ck, hdr_args)
-                if predicted:
-                    unique = self._unique_path(predicted)
-                    if unique != predicted:
-                        self.after(0, self._write_log,
-                                   f"📋 Mevcut dosya var → {os.path.basename(unique)}\n", "inf")
-                    out_path = unique
-                else:
-                    out_path = os.path.join(self.download_dir.get(), "%(title)s.%(ext)s")
+                self._run_job(job)
+            except Exception as e:   # iş parçacığı asla ölmesin
+                job["status"] = ST_ERR
+                job["msg"] = str(e)
+                self._ui_q.put(("done", job))
 
-                self.after(0, self._write_log, "▶ İndirme başlıyor...\n\n", "inf")
+    def _get_filename(self, ytdlp, job, hdr_args):
+        out = os.path.join(job["outdir"], "%(title)s.%(ext)s")
+        cmd = [ytdlp, "--ignore-config", "--print", "filename",
+               "--simulate", "-o", out]
+        cmd += self._format_args(job["quality"])
+        cmd += self._cookie_args(job["cookies"])
+        cmd += hdr_args
+        cmd.append(job["url"])
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL, creationflags=NO_WINDOW,
+                env=CHILD_ENV, text=True, encoding="utf-8", errors="replace"
+            )
+            job["proc"] = proc          # bu aşamada da iptal edilebilsin
+            stdout, _ = proc.communicate()
+            job["proc"] = None
+            for l in reversed(stdout.strip().splitlines()):
+                l = l.strip()
+                if l and not l.startswith("["):
+                    return l
+        except Exception:
+            job["proc"] = None
+        return None
 
-                cmd = [ytdlp, "--ignore-config"] + self._format_args(q)
-                cmd += ["-o", out_path]
-                cmd += self._cookie_args(ck)
-                cmd += hdr_args
-                cmd += speed_args
-                cmd.append(url)
+    def _parse_progress(self, job, line):
+        """yt-dlp / aria2c ilerleme satırını işe yazar. Satır ilerleme satırıysa True döner."""
+        m = PROGRESS_RE.search(line)
+        if m:
+            job["percent"] = float(m.group(1))
+            s = SPEED_RE.search(line)
+            e = ETA_RE.search(line)
+            job["speed_txt"] = s.group(1) if s else ""
+            job["eta"] = e.group(1) if e else ""
+            if job["status"] == ST_MERGE:
+                job["status"] = ST_RUN
+            return True
+        m = ARIA_RE.search(line)
+        if m:
+            job["percent"] = float(m.group(1))
+            s = ARIA_DL_RE.search(line)
+            e = ARIA_ETA_RE.search(line)
+            job["speed_txt"] = (s.group(1) + "/s") if s else ""
+            job["eta"] = e.group(1) if e else ""
+            return True
+        return False
 
-                proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL, creationflags=NO_WINDOW,
-                    env=CHILD_ENV,
-                    text=True, encoding="utf-8", errors="replace"
-                )
-                for line in proc.stdout:
-                    tag = "ok" if ("[download]" in line or "Destination" in line) \
-                        else "err" if "ERROR" in line else ""
-                    self.after(0, self._write_log, line, tag)
-                proc.wait()
+    def _run_job(self, job):
+        jid = job["id"]
 
-                if proc.returncode == 0:
-                    self.after(0, self._write_log, "\n✅ İndirme tamamlandı!\n", "ok")
-                    self._ui_q.put(("notify", "✅ İndirme tamamlandı"))
-                else:
-                    if proc.returncode == 3:
-                        self.after(0, self._write_log,
-                                   "\n⚠ yt-dlp yerine bu programın kendisi çalıştı. "
-                                   "Exe'nin adı 'yt-dlp.exe' olmasın ve PATH'teki "
-                                   "yt-dlp.exe'yi kontrol et.\n", "err")
-                    self.after(0, self._write_log, "\n❌ İndirme başarısız.\n", "err")
-                    self._ui_q.put(("notify", "❌ İndirme başarısız"))
-            except FileNotFoundError:
-                self.after(0, self._write_log,
-                           "❌ yt-dlp bulunamadı! PATH'e eklenmiş mi?\n", "err")
-            finally:
-                self._is_downloading = False
-                self.after(0, lambda: self.btn_dl.config(
-                    state="normal", text="⬇ İNDİR"))
+        def log(text, tag=""):
+            self._ui_q.put(("log", (f"[#{jid}] {text}", tag)))
 
-        threading.Thread(target=run, daemon=True).start()
+        def touch():
+            self._ui_q.put(("refresh", None))
+
+        status = ST_ERR
+        try:
+            job["status"] = ST_RUN
+            job["note"] = "hazırlanıyor"
+            touch()
+
+            ytdlp = find_ytdlp()
+            if not ytdlp:
+                job["msg"] = "yt-dlp bulunamadı (PATH'te yt-dlp.exe olmalı)"
+                log("❌ " + job["msg"] + "\n", "err")
+                return
+            if ytdlp != self._logged_ytdlp:
+                self._logged_ytdlp = ytdlp
+                log(f"🔧 yt-dlp: {ytdlp}\n", "inf")
+
+            hdr_args = self._header_args(job["headers"])
+            if hdr_args:
+                log("🔑 Eklentiden gelen başlıklar kullanılıyor: "
+                    + ", ".join(job["headers"].keys()) + "\n", "inf")
+            speed_args, speed_msg = self._speed_args(job["speed"])
+            log(f"⚡ {speed_msg}\n", "inf")
+
+            predicted = self._get_filename(ytdlp, job, hdr_args)
+            if job["cancel"]:
+                status = ST_CANCEL
+                return
+
+            if predicted:
+                out_path = self._unique_path(predicted)
+                if out_path != predicted:
+                    log(f"📋 Mevcut dosya var → {os.path.basename(out_path)}\n", "inf")
+                job["title"] = os.path.basename(out_path)
+                job["out_path"] = out_path
+                out_arg = out_path.replace("%", "%%")   # -o şablonunda '%' özel karakterdir
+            else:
+                out_arg = os.path.join(job["outdir"], "%(title)s.%(ext)s")
+
+            job["note"] = ""
+            touch()
+            log("▶ İndirme başlıyor...\n", "inf")
+
+            cmd = [ytdlp, "--ignore-config", "--newline"] + self._format_args(job["quality"])
+            cmd += ["-o", out_arg]
+            cmd += self._cookie_args(job["cookies"])
+            cmd += hdr_args
+            cmd += speed_args
+            cmd.append(job["url"])
+
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, creationflags=NO_WINDOW,
+                env=CHILD_ENV,
+                text=True, encoding="utf-8", errors="replace"
+            )
+            job["proc"] = proc
+            if job["cancel"]:       # hazırlık sırasında iptal edildiyse
+                kill_tree(proc)
+
+            last = 0.0
+            for raw in proc.stdout:
+                line = raw.rstrip("\r\n")
+                if not line.strip():
+                    continue
+                if self._parse_progress(job, line):
+                    now = time.time()
+                    if now - last > 0.2:
+                        last = now
+                        touch()
+                    continue            # ilerleme satırları çıktıya yazılmaz (liste gösteriyor)
+                if line.startswith("[download] Destination"):
+                    job["stage"] += 1   # görüntü ve ses ayrı indiriliyorsa 2. akış
+                    job["percent"] = 0.0
+                    job["status"] = ST_RUN
+                    touch()
+                elif line.startswith(MERGE_PREFIXES):
+                    job["status"] = ST_MERGE
+                    job["percent"] = 100.0
+                    job["speed_txt"] = ""
+                    job["eta"] = ""
+                    touch()
+                if "ERROR" in line:
+                    job["msg"] = line.split("ERROR:", 1)[-1].strip()
+                tag = "err" if "ERROR" in line else \
+                    "ok" if ("[download]" in line or "Destination" in line) else ""
+                log(line + "\n", tag)
+            proc.wait()
+
+            rc = proc.returncode
+            if rc == 0:
+                status = ST_DONE
+                job["percent"] = 100.0
+            elif job["cancel"]:
+                status = ST_CANCEL
+            else:
+                status = ST_ERR
+                if rc == 3:
+                    job["msg"] = ("yt-dlp yerine bu programın kendisi çalıştı. Exe'nin adı "
+                                  "'yt-dlp.exe' olmasın ve PATH'teki yt-dlp.exe'yi kontrol et.")
+                elif not job["msg"]:
+                    job["msg"] = f"yt-dlp hata kodu {rc}"
+        except FileNotFoundError:
+            job["msg"] = "yt-dlp bulunamadı! PATH'e eklenmiş mi?"
+        except Exception as e:
+            job["msg"] = str(e)
+        finally:
+            job["proc"] = None
+            job["note"] = ""
+            job["speed_txt"] = ""
+            job["eta"] = ""
+            job["status"] = status
+            self._ui_q.put(("done", job))
+
+    def _on_job_done(self, job):
+        """Bir iş bittiğinde (ana iş parçacığı): çıktıya yaz, tepsideyse bildirim gönder."""
+        jid = job["id"]
+        title = short(job["title"], 60)
+        if job["status"] == ST_DONE:
+            self._write_log(f"✅ [#{jid}] Tamamlandı: {job['title']}\n", "ok")
+            self._notify(f"✅ {title}")
+        elif job["status"] == ST_CANCEL:
+            self._write_log(f"⏹ [#{jid}] İptal edildi\n", "inf")
+        else:
+            why = f": {job['msg']}" if job["msg"] else ""
+            self._write_log(f"❌ [#{jid}] Başarısız{why}\n", "err")
+            self._notify(f"❌ {title}")
+
+    # ── Kuyruk listesi ─────────────────────────────────────────
+    def _row_values(self, j):
+        st = j["status"]
+        if st == ST_RUN:
+            status = j["note"] or "indiriliyor"
+            if j["stage"] > 1 and not j["note"]:
+                status += f" ({j['stage']}. akış)"
+        else:
+            status = st
+        if st in (ST_RUN, ST_MERGE, ST_DONE):
+            prog = bar_text(j["percent"])
+        elif st in (ST_ERR, ST_CANCEL) and j["percent"] > 0:
+            prog = bar_text(j["percent"])
+        else:
+            prog = ""
+        return (f"#{j['id']}  {short(j['title'], 36)}", status, prog,
+                j["speed_txt"], j["eta"])
+
+    def _refresh_tree(self):
+        """Listeyi iş durumlarıyla eşitler (seçimi bozmadan)."""
+        want = {str(j["id"]) for j in self._jobs_list}
+        for iid in self.tree.get_children():
+            if iid not in want:
+                self.tree.delete(iid)
+        existing = set(self.tree.get_children())
+        for j in self._jobs_list:
+            iid = str(j["id"])
+            vals = self._row_values(j)
+            tags = (STATUS_TAG[j["status"]],)
+            if iid in existing:
+                self.tree.item(iid, values=vals, tags=tags)
+            else:
+                self.tree.insert("", "end", iid=iid, values=vals, tags=tags)
+                self.tree.see(iid)
+
+        running = [j for j in self._jobs_list if j["status"] in (ST_RUN, ST_MERGE)]
+        waiting = sum(1 for j in self._jobs_list if j["status"] == ST_WAIT)
+        finished = sum(1 for j in self._jobs_list
+                       if j["status"] in (ST_DONE, ST_ERR, ST_CANCEL))
+        parts = []
+        if running:
+            parts.append(f"{len(running)} indiriliyor")
+        if waiting:
+            parts.append(f"{waiting} bekliyor")
+        if finished:
+            parts.append(f"{finished} bitti")
+        self.lbl_queue.config(text=" · ".join(parts) if parts else "Kuyruk boş")
+
+        # Görev çubuğunda küçültülmüş hâlde de ilerleme görünsün
+        if running:
+            t = f"yt-dlp İndirici — %{running[0]['percent']:.0f}"
+            if waiting:
+                t += f" (+{waiting} bekliyor)"
+            self.title(t)
+        else:
+            self.title("yt-dlp İndirici")
+
+    def _selected_jobs(self):
+        sel = set(self.tree.selection())
+        return [j for j in self._jobs_list if str(j["id"]) in sel]
+
+    def _cancel_job(self, j):
+        if j["status"] == ST_WAIT:
+            j["status"] = ST_CANCEL          # işçi sıradan alınca atlar
+        elif j["status"] in (ST_RUN, ST_MERGE):
+            j["cancel"] = True
+            if j.get("proc"):
+                kill_tree(j["proc"])
+
+    def _cancel_selected(self):
+        jobs = self._selected_jobs()
+        if not jobs:
+            self._write_log("ℹ Önce listeden iptal edilecek satırı seç.\n", "inf")
+            return
+        for j in jobs:
+            self._cancel_job(j)
+        self._refresh_tree()
+
+    def _retry_selected(self):
+        jobs = [j for j in self._selected_jobs() if j["status"] in (ST_ERR, ST_CANCEL)]
+        if not jobs:
+            self._write_log("ℹ Yeniden denemek için hata veren ya da iptal edilen bir satır seç.\n", "inf")
+            return
+        for j in jobs:
+            j.update(status=ST_WAIT, percent=0.0, speed_txt="", eta="",
+                     msg="", note="", stage=0, cancel=False)
+            self._pending.put(j)
+            self._write_log(f"↻ [#{j['id']}] Yeniden kuyruğa alındı\n", "inf")
+        self._refresh_tree()
+
+    def _remove_jobs(self, jobs):
+        busy = 0
+        for j in jobs:
+            if j["status"] in (ST_RUN, ST_MERGE):
+                self._cancel_job(j)          # çalışan iş önce iptal edilir, sonra kaldırılır
+                busy += 1
+                continue
+            if j["status"] == ST_WAIT:
+                j["status"] = ST_CANCEL      # sıradaki kopyası işçi tarafından atlanır
+            if j in self._jobs_list:
+                self._jobs_list.remove(j)
+        if busy:
+            self._write_log("ℹ Çalışan indirme iptal edildi; bittiğinde tekrar 'Kaldır'a bas.\n", "inf")
+        self._refresh_tree()
+
+    def _remove_selected(self):
+        jobs = self._selected_jobs()
+        if jobs:
+            self._remove_jobs(jobs)
+
+    def _clear_finished(self):
+        self._remove_jobs([j for j in self._jobs_list
+                           if j["status"] in (ST_DONE, ST_ERR, ST_CANCEL)])
+
+    def _open_selected_folder(self):
+        jobs = self._selected_jobs()
+        d = jobs[0]["outdir"] if jobs else self.download_dir.get()
+        try:
+            if os.name == "nt":
+                os.startfile(d)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", d])
+            else:
+                subprocess.Popen(["xdg-open", d])
+        except Exception as e:
+            self._write_log(f"⚠ Klasör açılamadı: {e}\n", "err")
+
+    def _on_tree_rightclick(self, event):
+        iid = self.tree.identify_row(event.y)
+        if iid and iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        try:
+            self.qmenu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.qmenu.grab_release()
 
 
 if __name__ == "__main__":
